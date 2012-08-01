@@ -1,0 +1,123 @@
+#!/bin/bash
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>
+
+##########################################################################
+# Title      :  sync_commands
+# Author     :  Simon Blandford <simon -at- onepointltd -dt- com>
+# Date       :  2011-03-30
+# Requires   :  zimbra live_syncd inotify-tools
+# Category   :  Administration
+# Version    :  1.0.0
+# Copyright  :  Simon Blandford, Onepoint Consulting Limited
+# License    :  GPLv3 (see above)
+##########################################################################
+# Description
+# Keep two Zimbra servers synchronised in near-realtime, local agent
+##########################################################################
+
+if [ "$( whoami )" != "zimbra" ]; then
+  echo "Must run as zimbra user" >&2
+  exit 1
+fi
+
+#Check for rsync of redolog or ldap
+if echo "$SSH_ORIGINAL_COMMAND" | \
+  grep "rsync" | \
+    egrep "/opt/zimbra/redolog/|/opt/zimbra/data/ldap/" &>/dev/null; then
+  case "$SSH_ORIGINAL_COMMAND" in
+  *\&*)
+    echo "Rejected"
+    ;;
+  *\(*)
+    echo "Rejected"
+    ;;
+  *\{*)
+    echo "Rejected"
+    ;;
+  *\;*)
+    echo "Rejected"
+    ;;
+  *\<*)
+    echo "Rejected"
+    ;;
+  *\`*)
+    echo "Rejected"
+    ;;
+  rsync\ --server*)
+    $SSH_ORIGINAL_COMMAND
+    ;;
+  *)
+    echo "Rejected"
+    ;;
+  esac
+else
+  #Not rsync
+  case "$#" in
+  0) read command
+    ;;
+  *) command=$1
+    ;;
+  esac
+
+  check_inotify () {
+    if ! which inotifywait &>/dev/null; then
+      echo "inotifywait not found" >&2
+      echo "Please install inotify-tools" >&2
+      exit 1
+    fi
+  }
+
+  case $command in
+    test)
+      if ps aux | grep "live_syncd" | grep -v grep &>/dev/null; then
+        echo "busy"
+      else
+        echo "OK"
+      fi
+      ;;
+    wait_redo)
+      #Wait for redo log roll-over
+      check_inotify
+      inotifywait -r /opt/zimbra/redolog -e moved_to
+      ;;
+    wait_ldap)
+      #Wait for ldap changes
+      check_inotify
+      inotifywait -r /opt/zimbra/data/ldap -e modify \
+        -e attrib -e close_write -e moved_to -e moved_from \
+        -e move -e delete -e delete_self
+      ;;
+    stream)
+      #Live-stream redolog
+      tail -c +0 -f /opt/zimbra/redolog/redo.log
+      ;;
+    purge)
+      #Remove old archives
+      find /opt/zimbra/redolog/archive -mtime +1 -exec rm {} \;
+      ;;
+    query_incremental)
+      #Query whether incremental backups are scheduled
+      if which zmschedulebackup &>/dev/null && \
+          zmschedulebackup -q | \
+          egrep -o "i([[:space:]]+[0-9\*\-]+){5}" &>/dev/null; then
+        echo "true"
+      else
+        echo "false"
+      fi
+      ;;
+    *)
+      rsync
+      ;;
+  esac
+fi

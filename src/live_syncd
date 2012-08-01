@@ -1,0 +1,414 @@
+#!/bin/bash
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>
+
+##########################################################################
+# Title      :  live_syncd
+# Author     :  Simon Blandford <simon -at- onepointltd -dt- com>
+# Date       :  2011-04-09
+# Requires   :  zimbra sync_commands inotify-tools
+# Category   :  Administration
+# Version    :  1.0.2
+# Copyright  :  Simon Blandford, Onepoint Consulting Limited
+# License    :  GPLv3 (see above)
+##########################################################################
+# Description
+# Keep two Zimbra servers synchronised in near-realtime
+##########################################################################
+
+
+#******************************************************************************
+#********************** Globals ***********************************************
+#******************************************************************************
+
+base_dir="/opt/zimbra/live_sync"
+locking_dir="$base_dir""/lock"
+pid_dir="$base_dir""/pid"
+log_dir="$base_dir""/log"
+ldap_dir="$base_dir""/ldap"
+status_dir="$base_dir""/status"
+
+
+SSH="ssh -i /opt/zimbra/.ssh/live_sync -o StrictHostKeyChecking=no -o CheckHostIP=no"\
+" -o PreferredAuthentications=hostbased,publickey"
+lock_dir="$locking_dir""/live_sync.lock"
+stop_file="$status_dir""/live_sync.stop"
+watches_file="$status_dir""/watches"
+log_file="$log_dir""/live_sync.log"
+pid_file_ldap="$pid_dir""/ldap_live_sync.pid"
+pid_file_redo="$pid_dir""/redo_log_live_sync.pid"
+conf_file="$base_dir""/live_sync.conf"
+
+#******************************************************************************
+#********************** Functions *********************************************
+#******************************************************************************
+
+#Ensure ldap and mysql servers are running and then replay redo logs
+replay_redo_logs () {
+  ldap status &>/dev/null || ldap start &>/dev/null
+  mysql.server status status &>/dev/null || mysql.server start &>/dev/null
+  if ! ldap status &>/dev/null || ! mysql.server status status &>/dev/null; then
+    echo "Start of local ldap/mysql servers failed" >&2
+    ldap status >&2
+    mysql.server status >&2
+    #Return error to trigger a "break" in while loop
+    return 1
+  fi
+  echo -n "$( date ) :"
+  echo "Replaying redologs..."
+  if ! zmplayredo >/dev/null; then
+    echo "Replay of redolog failed" >&2
+    #No error returned here since "break" is not necessary
+  fi
+  echo -n "$( date ) :"
+  echo "Replaying redologs done"
+  return 0
+}
+
+#The redo log sync daemon
+redo_log_live_sync () {
+  local stream_pid archived_file i
+
+  echo -n "$( date ) :"
+  echo "Starting redo log live sync process"
+  #Mailbox process must not be running now
+  if zmmailboxdctl status &>/dev/null; then
+    zmmailboxdctl stop &>/dev/null
+  fi
+  if zmmailboxdctl status &>/dev/null; then
+    echo "Unable to stop local Zimbra mailbox service" >&2
+    return 1
+  fi
+  echo "Incremental backups enabled : $incremental_backups"
+  
+  while [ ! -f "$stop_file" ]; do
+    while [ ! -f "$stop_file" ]; do
+      #Wait for lock directory to be successfully created
+      while ! mkdir "$lock_dir" &>/dev/null; do
+        sleep 2
+      done
+      [ -f "$stop_file" ] && break
+      #Replay redo logs also at this point if incremental backups are happening in
+      #case redo log archives have now suddenly disappeared due to incremental backup
+      if [ "x""$incremental_backups" == "xtrue" ]; then
+        replay_redo_logs || break
+      fi
+      echo -n "$( date ) :"
+      echo "Syncing redologs..."
+      if ! rsync -e "$SSH" -aHz --force --delete \
+        "$remote_address"":/opt/zimbra/redolog/" "/opt/zimbra/redolog"; then
+        echo "Rsync of redolog failed" >&2
+        break
+      fi
+      echo -n "$( date ) :"
+      echo "Syncing redologs done"
+      replay_redo_logs || break
+      #If there are no incremental backups then remote archive directory will need purging
+      if [ "x""$incremental_backups" != "xtrue" ]; then
+        echo purge | \
+          $SSH "$remote_address" "/opt/zimbra/live_sync/sync_commands"
+      fi
+      #Establish copy-and-live-stream of current redo.log file
+      echo stream | \
+        $SSH "$remote_address" \
+        "/opt/zimbra/live_sync/sync_commands" >"/opt/zimbra/redolog/redo.log" &
+      stream_pid=$!
+      disown $stream_pid
+      #Delay as PID was sometimes not being found if checked immediately
+      sleep 5
+      #If successfully established stream then sit and wait for move to archive
+      if ps $stream_pid | grep "/opt/zimbra/live_sync/sync_commands" &>/dev/null; then
+        #Remove lock file, this is resting point
+        rmdir "$lock_dir" &>/dev/null
+        #Wait for name to be passed of new archive file after redo.log is moved on remote server
+        #This is normal resting point of this process
+        archived_file=$( echo wait_redo | \
+          $SSH "$remote_address" "/opt/zimbra/live_sync/sync_commands" | \
+          tail -n 1 | egrep -o "redo-.*log" )
+        #Kill stream
+        kill -KILL $( ps aux | grep "/opt/zimbra/live_sync/sync_commands" | \
+          grep -v grep | awk '{print $2}' ) &>/dev/null
+        #Mirror move operation on local server
+        if echo "$archived_file" | egrep "redo-.*log" &>/dev/null; then
+          echo "Moving redo.log to $archived_file"
+          mv -f "/opt/zimbra/redolog/redo.log" "/opt/zimbra/redolog/archive/""$archived_file"
+        else
+          echo "Archive file name not found" >&2
+        fi
+        [ -f "$stop_file" ] && break
+      else
+        echo "Failed to start redolog streaming, PID=$stream_pid" >&2
+        break
+      fi
+    done
+    rmdir "$lock_dir" &>/dev/null
+    #Wait 10 minutes for error to error to clear
+    i=0
+    while [ $(( i++ )) -lt 60 ] && [ ! -f "$stop_file" ]; do
+      sleep 10
+    done
+  done
+  echo -n "$( date ) :"
+  echo "Ending redo log live sync process"
+}
+
+#The ldap sync daemon
+ldap_live_sync () {
+  local ldap_wait_pid i
+
+  echo -n "$( date ) :"
+  echo "Starting ldap live sync process"
+  while [ ! -f "$stop_file" ]; do
+    while [ ! -f "$stop_file" ]; do
+      #Wait for lock directory to be successfully created
+      while ! mkdir "$lock_dir" &>/dev/null; do
+        sleep 3
+      done
+      echo -n "$( date ) :"
+      echo "Syncing ldap"
+      while [ 1 ]; do
+        #Check for changes during ldap sync operation
+        echo wait_ldap | \
+          $SSH "$remote_address" "/opt/zimbra/live_sync/sync_commands" &>"$watches_file" &
+        ldap_wait_pid=$!
+        disown $ldap_wait_pid
+        if ! ps "$ldap_wait_pid" &>/dev/null; then
+          echo "Unable to establish watch on remote LDAP directory, no ldap sync performed"
+          break
+        fi
+        #Wait for watches to be established
+        while ! grep "established" "$watches_file" &>/dev/null && \
+            ps "$ldap_wait_pid" &>/dev/null; do
+          sleep 1
+        done
+        #Echo out status
+        cat "$watches_file"
+        rm -f "$watches_file"
+        #Rsync remote server to temporary local ldap directory
+        if ! rsync -e "$SSH" -aHz --force --delete \
+          "$remote_address"":/opt/zimbra/data/ldap/" "$ldap_dir""/"; then
+          echo "Rsync of ldap failed" >&2
+          break
+        fi
+        ps $ldap_wait_pid &>/dev/null && break
+        echo "Ldap changed during rsync. Re-syncing."
+        sleep 10
+      done
+      kill -KILL $ldap_wait_pid &>/dev/null
+      #Stop ldap
+      ldap status &>/dev/null && ldap stop &>/dev/null
+      if ldap status &>/dev/null; then
+        echo "Unable to stop local ldap server" >&2
+        break
+      fi
+      #rsync temporary local ldap directory to real local ldap directory
+      rsync -aH "$ldap_dir""/" "/opt/zimbra/data/ldap/"
+      #Restart ldap
+      ldap status &>/dev/null || ldap start &>/dev/null
+      if ! ldap status &>/dev/null; then
+        echo "Unable to restart local ldap server" >&2
+      fi
+      echo -n "$( date ) :"
+      echo "Syncing LDAP done"
+      rmdir "$lock_dir" &>/dev/null
+      [ -f "$stop_file" ] && break
+      #Wait for change in remote ldap over 10 minute intervals
+      echo wait_ldap | \
+        $SSH "$remote_address" "/opt/zimbra/live_sync/sync_commands" &
+      ldap_wait_pid=$!
+      disown $ldap_wait_pid
+      while [ ! -f "$stop_file" ]; do
+        #Restart wait for ldap change if required
+        if ! ps $ldap_wait_pid &>/dev/null; then
+          echo wait_ldap | \
+            $SSH "$remote_address" "/opt/zimbra/live_sync/sync_commands" &
+          ldap_wait_pid=$!
+          disown $ldap_wait_pid
+        fi
+        #Wait 10 minutes
+        i=0
+        while [ $(( i++ )) -lt 60 ] && [ ! -f "$stop_file" ]; do
+          sleep 10
+        done
+        #If wait process is not still running then there was a change
+        ps $ldap_wait_pid &>/dev/null || break
+      done
+    done
+    rmdir "$lock_dir" &>/dev/null
+    #Wait 10 minutes for error to error to clear
+    i=0
+    while [ $(( i++ )) -lt 60 ] && [ ! -f "$stop_file" ]; do
+      sleep 10
+    done
+  done
+  echo -n "$( date ) :"
+  echo "Ending ldap live sync process"
+}
+
+kill_everything () {
+  touch "$stop_file"
+  kill -KILL $( head -n 1 "$pid_file_ldap" 2>/dev/null ) &>/dev/null
+  kill -KILL $( head -n 1 "$pid_file_redo" 2>/dev/null ) &>/dev/null
+  kill -KILL $( ps aux | grep "live_syncd start" | grep -v grep | awk '{print $2}' ) &>/dev/null
+  kill -KILL $( ps aux | grep "redo_log_live_sync" | grep -v grep | awk '{print $2}' ) &>/dev/null
+  kill -KILL $( ps aux | grep "ldap_live_sync" | grep -v grep | awk '{print $2}' ) &>/dev/null
+  kill -KILL $( ps aux | \
+    grep "/opt/zimbra/live_sync/sync_commands" | grep -v grep | awk '{print $2}' ) &>/dev/null
+  rm -f "$stop_file"
+  rm -f "$pid_file_ldap"
+  rm -f "$pid_file_redo"
+  rmdir "$lock_dir" &>/dev/null
+}
+
+quitting () {
+  echo "Quitting"
+  #Kill any hanging processes
+  kill_everything
+  trap - INT TERM SIGINT SIGTERM
+  echo 'kill -KILL $( ps aux | grep live_syncd | grep -v grep | awk '"'"'{print $2}'"'"' ) &>/dev/null' | \
+    at now && sleep 1 && rmdir "$lock_dir" &>/dev/null
+  exit
+}
+
+
+#******************************************************************************
+#********************** Main Program ******************************************
+#******************************************************************************
+
+if [ "$( whoami )" != "zimbra" ]; then
+  echo "Must run as zimbra user" >&2
+  exit 1
+fi
+
+mkdir -p "$locking_dir"
+mkdir -p "$pid_dir"
+mkdir -p "$log_dir"
+mkdir -p "$ldap_dir"
+mkdir -p "$status_dir"
+
+if [ ! -f "$conf_file" ]; then
+  echo "Configuration file, $conf_file, not found" >&2
+  exit 1
+fi
+
+source "$conf_file"
+
+#Find all local addresses
+server_addresses=$( /sbin/ifconfig | grep inet | \
+  egrep -io "addr:[[:space:]]*(([0-9]+\.){3}[0-9]+|[0-9a-f]+(:[0-9a-f]*){5})" | \
+  sed "s/addr://" | tr -d " \t" )
+
+#Check configured server addresses are valid
+if ! echo "$server1" | \
+    egrep -i "([0-9]+\.){3}[0-9]+|[0-9a-f]+(:[0-9a-f]*){5}" &>/dev/null; then
+  echo "No valid IP address found for server1 in configuration file" >&2
+  exit 1
+fi
+if ! echo "$server2" | \
+    egrep -i "([0-9]+\.){3}[0-9]+|[0-9a-f]+(:[0-9a-f]*){5}" &>/dev/null; then
+  echo "No valid IP address found for server2 in configuration file" >&2
+  exit 1
+fi
+
+#Deduce local address and assume other address is remote machine
+if echo "$server_addresses" | grep "$server1" &>/dev/null; then
+  local_address="$server1"
+  remote_address="$server2"
+else
+  if echo "$server_addresses" | grep "$server2" &>/dev/null; then
+    local_address="$server2"
+    remote_address="$server1"
+  else
+    echo "Unable to identify local server address and assume remote address" >&2
+    exit 1
+  fi
+fi
+
+#Check remote server is OK
+remote_server_status=$( echo "test" |
+  $SSH "$remote_address" "/opt/zimbra/live_sync/sync_commands" )
+
+if [ "x""$remote_server_status" == "xbusy" ]; then
+  echo "Remote server appears to have live_syncd process running" >&2
+  echo "This can not run on both servers" >&2
+  exit 1
+fi
+
+if [ "x""$remote_server_status" != "xOK" ]; then
+  echo "Unable to run commands on remote server" >&2
+  exit 1
+fi
+
+incremental_backups=$( echo "query_incremental" |
+  $SSH "$remote_address" "/opt/zimbra/live_sync/sync_commands" )
+
+case $1 in
+  start)
+    if [ -f  $pid_file_redo ] || [ -f  $pid_file_ldap ]; then
+      echo "Proccess already running"
+    else
+      echo -n "Starting processes..."
+      ldap_live_sync >>"$log_file" 2>&1 &
+      echo $! >"$pid_file_ldap"
+      redo_log_live_sync >>"$log_file" 2>&1 &
+      echo $! >"$pid_file_redo"
+      echo "done"
+    fi
+    ;;
+  stop)
+    touch "$stop_file"
+    [ -d "$lock_dir" ] && echo "Waiting for sync operations to complete..."
+    while [ -d "$lock_dir" ]; do
+      sleep 5
+    done
+    rm -f "$stop_file"
+    replay_redo_logs
+    kill_everything
+    echo "done"
+    ;;
+  status)
+    if [ -f  $pid_file_redo ] && ps $( head -n 1 $pid_file_redo 2>/dev/null ) &>/dev/null; then
+      echo "redo log sync process OK"
+      redo_stat=0
+    else
+      echo "redolog sync process stopped"
+      redo_stat=3
+    fi
+    if [ -f  $pid_file_ldap ] && ps $( head -n 1 $pid_file_ldap 2>/dev/null ) &>/dev/null; then
+      echo "ldap sync process OK"
+      ldap_stat=0
+    else
+      echo "ldap sync process stopped"
+      ldap_stat=3
+    fi
+    [ $ldap_stat == 3 ] && [ $redo_stat == 3 ] && exit 3
+    [ $ldap_stat == 0 ] && [ $redo_stat == 0 ] && exit 0
+    exit 1
+    ;;
+  kill)
+    kill_everything
+    ;;
+  *)
+    trap quitting INT TERM SIGINT SIGTERM
+    if ps aux | grep "redo_log_live_sync" | grep -v grep  &>/dev/null || \
+        ps aux | grep "ldap_live_sync" | grep -v grep  &>/dev/null; then
+      echo "Proccess already running"
+    else
+      echo "Starting processes in realtime"
+      ldap_live_sync &
+      echo $! >"$pid_file_ldap"
+      redo_log_live_sync &
+      echo $! >"$pid_file_redo"
+      while [ 1 ]; do sleep 10; done
+    fi
+esac
