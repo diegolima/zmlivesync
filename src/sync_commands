@@ -18,7 +18,7 @@
 # Date       :  2011-03-30
 # Requires   :  zimbra live_syncd inotify-tools
 # Category   :  Administration
-# Version    :  1.0.0
+# Version    :  1.0.1
 # Copyright  :  Simon Blandford, Onepoint Consulting Limited
 # License    :  GPLv3 (see above)
 ##########################################################################
@@ -93,6 +93,7 @@ else
       ;;
     wait_ldap)
       #Wait for ldap changes
+	  kill -KILL $(ps aux | grep "inotifywait -r /opt/zimbra/data/ldap" | grep -v grep | awk '{print $2}')
       check_inotify
       inotifywait -r /opt/zimbra/data/ldap -e modify \
         -e attrib -e close_write -e moved_to -e moved_from \
@@ -100,6 +101,7 @@ else
       ;;
     stream)
       #Live-stream redolog
+	  kill -KILL $(ps aux | grep "tail -c +0 -f /opt/zimbra/redolog/redo.log" | grep -v grep | awk '{print $2}')
       tail -c +0 -f /opt/zimbra/redolog/redo.log
       ;;
     purge)
