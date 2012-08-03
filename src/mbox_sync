@@ -16,9 +16,9 @@
 PATH=/opt/zimbra/bin:/opt/zimbra/postfix/sbin:/opt/zimbra/openldap/bin:/opt/zimbra/snmp/bin:/opt/zimbra/rsync/bin:/opt/zimbra/bdb/bin:/opt/zimbra/openssl/bin:/opt/zimbra/java/bin:$PATH
 
 HOST_SLAVE="{ADDR_SLAVE}"
-PASSWORD_LDAP_SLAVE="mYK80yJt6"
-HOST_MASTER="172.20.0.95"
-PASSWORD_MYSQL_MASTER="dp8g9xWemOs_BIyJGaOj7drJTC"
+HOST_MASTER="{ADDR_MASTER}"
+PASSWORD_LDAP_SLAVE="{LDAPSLAVEPASS}"
+PASSWORD_MYSQL_MASTER="{MYSQLMASTERPASS}"
 
 
 ldapsearch -x -H ldap://$HOST_SLAVE:389 -D uid=zimbra,cn=admins,cn=zimbra -w $PASSWORD_LDAP_SLAVE  -LLL mail | grep mail: | awk '{print $2}' | sort > /tmp/ldap-slave.list
