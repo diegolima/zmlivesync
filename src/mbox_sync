@@ -1,0 +1,47 @@
+#!/bin/bash
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>
+
+##########################################################################
+PATH=/opt/zimbra/bin:/opt/zimbra/postfix/sbin:/opt/zimbra/openldap/bin:/opt/zimbra/snmp/bin:/opt/zimbra/rsync/bin:/opt/zimbra/bdb/bin:/opt/zimbra/openssl/bin:/opt/zimbra/java/bin:$PATH
+
+HOST_SLAVE="{ADDR_SLAVE}"
+PASSWORD_LDAP_SLAVE="mYK80yJt6"
+HOST_MASTER="172.20.0.95"
+PASSWORD_MYSQL_MASTER="dp8g9xWemOs_BIyJGaOj7drJTC"
+
+
+ldapsearch -x -H ldap://$HOST_SLAVE:389 -D uid=zimbra,cn=admins,cn=zimbra -w $PASSWORD_LDAP_SLAVE  -LLL mail | grep mail: | awk '{print $2}' | sort > /tmp/ldap-slave.list
+echo "select comment from mailbox" |  mysql "zimbra"  | grep @ | sort > /tmp/mailbox-slave.list
+diff /tmp/ldap-slave.list /tmp/mailbox-slave.list  | grep @ | awk '{print $2}' | grep -v postmaster | grep -v root > /tmp/contas.txt
+
+
+for email in `cat /tmp/contas.txt`
+do
+        echo "select account_id,id from mailbox where comment=\"$email\"" | mysql -h $HOST_MASTER   -u zimbra    -P 7306 --password=$PASSWORD_MYSQL_MASTER "zimbra"      | grep -v account_id > /tmp/dados_contas.txt
+        DADOS=`cat /tmp/dados_contas.txt`
+        cd /opt/zimbra/lib/jars/
+        if ! [ -z "$DADOS" ]; then
+                printf "INFO - Creating mailbox for user $email    " >> /opt/zimbra/live_sync/log/mbox_sync.log
+                java -Djava.library.path=/opt/zimbra/lib -Djava.ext.dirs=/opt/zimbra/java/jre/lib/ext:/opt/zimbra/mailboxd/lib:/opt/zimbra/mailboxd/common/lib:/opt/zimbra/lib/jars:/opt/zimbra/lib/ext/zimbraadminversioncheck:/opt/zimbra/lib/ext/com_zimbra_cert_manager:/opt/zimbra/lib/ext/com_zimbra_bulkprovision:/opt/zimbra/lib/ext/nginx-lookup:/opt/zimbra/lib/ext/clamscanner:/opt/zimbra/lib/ext/zimbraldaputils com.zimbra.cs.redolog.op.CreateMailbox4linux  $DADOS
+                if [ $? = 0 ]; then
+                        printf "[OK]\n" >> /opt/zimbra/live_sync/log/mbox_sync.log
+                else
+                        printf "[ERROR]\n" >> /opt/zimbra/live_sync/log/mbox_sync.log
+                fi
+        else
+            # Uncomment to see debug messages
+                #echo "INFO - No data for $email - skipping. If this is a list or a user that never logged in this is perfectly normal"
+                true
+        fi
+done
